@@ -11,7 +11,7 @@ import { PROBLEM_KIND } from "@theia/markers/lib/common/problem-marker";
 import { MiniBrowserOpenHandler } from "@theia/mini-browser/lib/browser/mini-browser-open-handler";
 import { inject, postConstruct } from "inversify";
 import { GitpodPortViewWidget, PORT_WIDGET_FACTORY_ID } from "./gitpod-port-view-widget";
-import { ExposedServedPort, GitpodPortsService } from "./gitpod-ports-service";
+import { ExposedServedPort, GitpodPortsService, isExposedServedPort } from "./gitpod-ports-service";
 import { PortsStatus } from "@gitpod/supervisor-api-grpc/lib/status_pb";
 
 export namespace PORT_COMMANDS {
@@ -118,7 +118,7 @@ export class GitpodPortViewContribution extends AbstractViewContribution<GitpodP
         const exposedPrivate: number[] = [];
 
         for (const port of this.portsService.ports) {
-            if (port.exposed) {
+            if (isExposedServedPort(port)) {
                 (port.exposed.pb_public ? exposedPublic : exposedPrivate).push(port.localPort);
             }
         }

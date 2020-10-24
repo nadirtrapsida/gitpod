@@ -98,6 +98,9 @@ class GitpodPortComponent extends React.Component<GitpodPortComponentProps> {
 
             actions.push(<button className="theia-button" onClick={this.onOpenPreview}>Open Preview</button>);
             actions.push(<button className="theia-button" onClick={this.onOpenBrowser}>Open Browser</button>);
+        }
+
+        if (port.exposed) {
             actions.push(<button className="theia-button" onClick={this.toggleVisiblity}>Make {port.exposed.pb_public ? 'Private' : 'Public'}</button>);
         }
 

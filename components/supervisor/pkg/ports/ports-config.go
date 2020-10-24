@@ -10,25 +10,11 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"sync"
 
 	"github.com/gitpod-io/gitpod/supervisor/pkg/gitpod"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
-
-// ConfigService provides access to port configurations
-type ConfigService struct {
-	workspaceID   string
-	configService gitpod.ConfigInterface
-	gitpodAPI     gitpod.APIInterface
-
-	portRangeRegexp *regexp.Regexp
-
-	workspaceConfigs     map[uint32]*gitpod.PortConfig
-	instancePortConfigs  map[uint32]*gitpod.PortConfig
-	instanceRangeConfigs []*RangeConfig
-	mutex                sync.RWMutex
-	ready                chan struct{}
-}
 
 // RangeConfig is a port range config
 type RangeConfig struct {
@@ -37,48 +23,53 @@ type RangeConfig struct {
 	End   uint32
 }
 
-// NewConfigService creates a new instance of ConfigService
-func NewConfigService(workspaceID string, configService gitpod.ConfigInterface, gitpodAPI gitpod.APIInterface) *ConfigService {
-	return &ConfigService{
-		workspaceID:     workspaceID,
-		configService:   configService,
-		gitpodAPI:       gitpodAPI,
-		portRangeRegexp: regexp.MustCompile("^(\\d+)[-:](\\d+)$"),
-		ready:           make(chan struct{}),
-	}
+// Configs provides access to port configurations
+type Configs struct {
+	workspaceConfigs     map[uint32]*gitpod.PortConfig
+	instancePortConfigs  map[uint32]*gitpod.PortConfig
+	instanceRangeConfigs []*RangeConfig
 }
 
-// ForEach iterates over all configured ports (can return duplicate)
-func (service *ConfigService) ForEach(callback func(port uint32, config *gitpod.PortConfig)) {
-	for _, configs := range []map[uint32]*gitpod.PortConfig{service.instancePortConfigs, service.workspaceConfigs} {
+// ForEach iterates over all configured ports
+func (configs *Configs) ForEach(callback func(port uint32, config *gitpod.PortConfig)) {
+	if configs == nil {
+		return
+	}
+	visited := make(map[uint32]struct{})
+	for _, configs := range []map[uint32]*gitpod.PortConfig{configs.instancePortConfigs, configs.workspaceConfigs} {
 		for port, config := range configs {
+			_, exists := visited[port]
+			if exists {
+				continue
+			}
+			visited[port] = struct{}{}
 			callback(port, config)
 		}
 	}
 }
 
 // Get returns the config for the give port
-func (service *ConfigService) Get(port uint32) (*gitpod.PortConfig, bool) {
-	<-service.ready
-
-	service.mutex.RLock()
-	defer service.mutex.RUnlock()
-
-	config, exists := service.instancePortConfigs[port]
+func (configs *Configs) Get(port uint32) (*gitpod.PortConfig, bool) {
+	if configs == nil {
+		return nil, false
+	}
+	config, exists := configs.instancePortConfigs[port]
 	if exists {
 		return config, true
 	}
-	config, exists = service.workspaceConfigs[port]
+	config, exists = configs.workspaceConfigs[port]
 	if exists {
 		return config, true
 	}
-	return service.GetRange(port)
+	return nil, false
 }
 
-// GetRange returns the range config for the give port
-func (service *ConfigService) GetRange(port uint32) (*gitpod.PortConfig, bool) {
-	<-service.ready
-	for _, rangeConfig := range service.instanceRangeConfigs {
+// GetFromRange returns the port config from the port range config
+func (configs *Configs) GetFromRange(port uint32) (*gitpod.PortConfig, bool) {
+	if configs == nil {
+		return nil, false
+	}
+	for _, rangeConfig := range configs.instanceRangeConfigs {
 		if rangeConfig.Start <= port && port <= rangeConfig.End {
 			return &gitpod.PortConfig{
 				Port:       float64(port),
@@ -90,79 +81,122 @@ func (service *ConfigService) GetRange(port uint32) (*gitpod.PortConfig, bool) {
 	return nil, false
 }
 
-// Observe provides channels triggered whenever the port configurations are changed
-func (service *ConfigService) Observe(ctx context.Context) (<-chan struct{}, <-chan error) {
-	updatesChan := make(chan struct{})
+// ConfigInterace allows to watch port configurations
+type ConfigInterace interface {
+	// Observe provides channels triggered whenever the port configurations are changed.
+	Observe(ctx context.Context) (<-chan *Configs, <-chan error)
+}
+
+// ConfigService allows to watch port configurations
+type ConfigService struct {
+	workspaceID   string
+	configService gitpod.ConfigInterface
+	gitpodAPI     gitpod.APIInterface
+	parser        *configParser
+}
+
+// NewConfigService creates a new instance of ConfigService
+func NewConfigService(workspaceID string, configService gitpod.ConfigInterface, gitpodAPI gitpod.APIInterface) *ConfigService {
+	return &ConfigService{
+		workspaceID:   workspaceID,
+		configService: configService,
+		gitpodAPI:     gitpodAPI,
+		parser:        newConfigParser(),
+	}
+}
+
+// Observe provides channels triggered whenever the port configurations are changed.
+func (service *ConfigService) Observe(ctx context.Context) (<-chan *Configs, <-chan error) {
+	updatesChan := make(chan *Configs)
 	errorsChan := make(chan error, 1)
 
 	go func() {
 		defer close(updatesChan)
 		defer close(errorsChan)
 
+		configs, errs := service.configService.Observe(ctx)
+
+		current := &Configs{}
 		if service.gitpodAPI != nil {
 			info, err := service.gitpodAPI.GetWorkspace(ctx, service.workspaceID)
 			if err != nil {
 				errorsChan <- err
 			} else {
-				service.mutex.Lock()
-				for _, config := range info.Workspace.Config.Ports {
-					if service.workspaceConfigs == nil {
-						service.workspaceConfigs = make(map[uint32]*gitpod.PortConfig)
-					}
-					port := uint32(config.Port)
-					_, exists := service.workspaceConfigs[port]
-					if !exists {
-						service.workspaceConfigs[port] = config
-					}
-				}
-				service.mutex.Unlock()
+				current.workspaceConfigs = service.parser.parseWorkspaceConfigs(info.Workspace.Config.Ports)
+				updatesChan <- &Configs{workspaceConfigs: current.workspaceConfigs}
 			}
 		} else {
-			errorsChan <- errors.New("failed to fetch the worksapce info - no connection ot the gitpod server")
+			errorsChan <- errors.New("could not connect to Gitpod API to fetch workspace port configs")
 		}
 
-		init := true
-		configs, errs := service.configService.Observe(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case config := <-configs:
-				service.update(config)
-				if init {
-					close(service.ready)
-					init = false
-				}
-				updatesChan <- struct{}{}
 			case err := <-errs:
 				errorsChan <- err
+			case config := <-configs:
+				if service.update(config, current) {
+					updatesChan <- &Configs{
+						workspaceConfigs:     current.workspaceConfigs,
+						instancePortConfigs:  current.instancePortConfigs,
+						instanceRangeConfigs: current.instanceRangeConfigs,
+					}
+				}
 			}
 		}
 	}()
 	return updatesChan, errorsChan
 }
 
-func (service *ConfigService) update(config *gitpod.GitpodConfig) {
-	service.mutex.Lock()
-	defer service.mutex.Unlock()
-
-	service.instancePortConfigs = nil
-	service.instanceRangeConfigs = nil
-
-	if config == nil {
-		return
+func (service *ConfigService) update(config *gitpod.GitpodConfig, current *Configs) bool {
+	currentPortConfigs, currentRangeConfigs := current.instancePortConfigs, current.instanceRangeConfigs
+	var ports []*gitpod.PortsItems
+	if config != nil {
+		ports = config.Ports
 	}
-	for _, config := range config.Ports {
+	portConfigs, rangeConfigs := service.parser.parseInstanceConfigs(ports)
+	current.instancePortConfigs = portConfigs
+	current.instanceRangeConfigs = rangeConfigs
+	return !(cmp.Equal(currentPortConfigs, portConfigs, cmpopts.SortMaps(func(x, y uint32) bool { return x < y })) && cmp.Equal(currentRangeConfigs, rangeConfigs))
+}
+
+type configParser struct {
+	portRangeRegexp *regexp.Regexp
+}
+
+func newConfigParser() *configParser {
+	return &configParser{
+		portRangeRegexp: regexp.MustCompile("^(\\d+)[-:](\\d+)$"),
+	}
+}
+
+func (parser *configParser) parseWorkspaceConfigs(ports []*gitpod.PortConfig) (portConfigs map[uint32]*gitpod.PortConfig) {
+	for _, config := range ports {
+		if portConfigs == nil {
+			portConfigs = make(map[uint32]*gitpod.PortConfig)
+		}
+		port := uint32(config.Port)
+		_, exists := portConfigs[port]
+		if !exists {
+			portConfigs[port] = config
+		}
+	}
+	return portConfigs
+}
+
+func (parser *configParser) parseInstanceConfigs(ports []*gitpod.PortsItems) (portConfigs map[uint32]*gitpod.PortConfig, rangeConfigs []*RangeConfig) {
+	for _, config := range ports {
 		rawPort := fmt.Sprintf("%v", config.Port)
 		Port, err := strconv.Atoi(rawPort)
 		if err == nil {
-			if service.instancePortConfigs == nil {
-				service.instancePortConfigs = make(map[uint32]*gitpod.PortConfig)
+			if portConfigs == nil {
+				portConfigs = make(map[uint32]*gitpod.PortConfig)
 			}
 			port := uint32(Port)
-			_, exists := service.instancePortConfigs[port]
+			_, exists := portConfigs[port]
 			if !exists {
-				service.instancePortConfigs[port] = &gitpod.PortConfig{
+				portConfigs[port] = &gitpod.PortConfig{
 					OnOpen:     config.OnOpen,
 					Port:       float64(Port),
 					Visibility: config.Visibility,
@@ -170,7 +204,7 @@ func (service *ConfigService) update(config *gitpod.GitpodConfig) {
 			}
 			continue
 		}
-		matches := service.portRangeRegexp.FindStringSubmatch(rawPort)
+		matches := parser.portRangeRegexp.FindStringSubmatch(rawPort)
 		if len(matches) != 3 {
 			continue
 		}
@@ -182,10 +216,11 @@ func (service *ConfigService) update(config *gitpod.GitpodConfig) {
 		if err != nil || start >= end {
 			continue
 		}
-		service.instanceRangeConfigs = append(service.instanceRangeConfigs, &RangeConfig{
+		rangeConfigs = append(rangeConfigs, &RangeConfig{
 			PortsItems: config,
 			Start:      uint32(start),
 			End:        uint32(end),
 		})
 	}
+	return portConfigs, rangeConfigs
 }
