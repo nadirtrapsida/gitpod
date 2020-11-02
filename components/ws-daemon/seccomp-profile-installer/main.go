@@ -30,7 +30,7 @@ func main() {
 			"chroot",
 			"pivot_root",
 			"mount",
-			"unmount",
+			"umount2",
 		},
 		Action: specs.ActAllow,
 	})
