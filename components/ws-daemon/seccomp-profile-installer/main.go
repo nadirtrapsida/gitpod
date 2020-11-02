@@ -28,6 +28,9 @@ func main() {
 			"clone",
 			"mount",
 			"chroot",
+			"pivot_root",
+			"mount",
+			"unmount",
 		},
 		Action: specs.ActAllow,
 	})
